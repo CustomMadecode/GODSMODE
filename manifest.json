@@ -1,7 +1,5 @@
-cat > /tmp/manifest.json <<EOF
-> {
+{
 >   "version": "1.0.0",
 >   "script": "godsmode.sh",
 >   "sha256": "$SHA"
 > }
-> EOF
