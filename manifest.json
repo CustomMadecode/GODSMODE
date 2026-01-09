@@ -1,5 +1,5 @@
 {
->   "version": "1.0.0",
->   "script": "godsmode.sh",
->   "sha256": "$SHA"
-> }
+  "version": "1.0.0",
+  "script": "godsmode.sh",
+  "sha256": "TEMP"
+}
