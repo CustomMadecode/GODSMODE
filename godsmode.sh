@@ -3,7 +3,7 @@ PIDFILE="/tmp/godmode.pid"
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
   exit 0
 fi
-# Flint 2 GOD MODE — Kernel 5.4.238 SAFE
+echo $$ > "$PIDFILE"echo "GODMODE SCRIPT OK - $(date)"# Flint 2 GOD MODE — Kernel 5.4.238 SAFE
 # - Live decisions: CAKE stats (tc -s) + nft counters + optional telemetry
 # - Flent: calibration only (never used for live loop; never runs during game)
 # - nftables DSCP tagging + game detection counters (no conntrack polling)
