@@ -1,5 +1,5 @@
 #!/bin/sh
-# ============================================================
+echo "godsmode.sh is plain text and running: $(date)"# ============================================================
 # Flint 2 GOD MODE — Kernel 5.4.238 SAFE
 # - Live decisions: CAKE stats (tc -s) + nft counters + optional telemetry
 # - Flent: calibration only (never used for live loop; never runs during game)
