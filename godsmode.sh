@@ -1,14 +1,17 @@
 #!/bin/sh
-# Flint 2 GOD MODE — OpenWrt 23.05-safe (TMHI-hardened)
-# - Static MTU set once
-# - nft DSCP mark IPv4/IPv6 + counters
-# - SQM AutoTune (robust parsing; skips on busy/failed/0Mbps)
-# - Installs procd boot service + cron daily apply + autotune every N hours
+# Flint 2 GOD MODE — OpenWrt 23.05-safe (30/10)
+# - Static MTU (once per run)
+# - CAKE SQM with safe section normalization
+# - PS5 priority when online (auto-detect from DHCP leases) -> DSCP EF (46)
+# - Game UDP ports DSCP EF
+# - AutoTune only when WAN is IDLE (won't run during traffic)
+# - Self-update script from GitHub (safe)
+# - procd boot + cron: daily apply + optional idle autotune + daily selfupdate
 
 set -eu
 
 # -----------------------------
-# Tunables (your TMHI profile)
+# TMHI profile
 # -----------------------------
 CAP_DOWN_MBIT=777
 CAP_UP_MBIT=140
@@ -24,21 +27,53 @@ THRESH_UP_PCT=6
 
 WAN_MTU=1370
 
+# -----------------------------
+# Priority / QoS
+# -----------------------------
 ENABLE_DSCP=1
-DSCP_GAME=46
+DSCP_GAME=46                      # EF
 GAME_PORTS="{ 3074, 3478-3479, 3659, 9295-9304, 1935 }"
 
-BUSY_RX_BYTES_PER_SEC=2500000
-BUSY_TX_BYTES_PER_SEC=1000000
+# PS5 priority (auto-detect)
+ENABLE_PS5_PRIORITY=1
+# Optional: pin PS5 IPs if you want (space-separated). Leave empty to auto-detect.
+PS5_IPS_V4=""
+# Optional: match DHCP hostname patterns (case-insensitive)
+PS5_HOST_PAT='(ps5|playstation|sony)'
 
+# -----------------------------
+# Busy / Idle thresholds
+# -----------------------------
+# Busy skip (speedtests) if WAN active
+BUSY_RX_BYTES_PER_SEC=2500000     # 2.5 MB/s
+BUSY_TX_BYTES_PER_SEC=1000000     # 1.0 MB/s
+# "Idle enough to autotune"
+IDLE_RX_BYTES_PER_SEC=120000      # 120 KB/s
+IDLE_TX_BYTES_PER_SEC=60000       # 60 KB/s
+
+# -----------------------------
+# Schedules (router local time)
+# -----------------------------
 DAILY_HOUR=4
 DAILY_MINUTE=17
+
 AUTOTUNE_MINUTE=7
 AUTOTUNE_EVERY_N_HOURS=3
 
-# SQM CAKE options (keep your intent; SQM may still show rtt 100ms)
+SELFUPDATE_HOUR=3
+SELFUPDATE_MINUTE=33
+
+# -----------------------------
+# SQM CAKE options
+# -----------------------------
 QDISC_OPTS="diffserv4 nat wash rtt 20ms memlimit 32mb"
 QDISC_OPTS_INGRESS="diffserv4 nat wash rtt 20ms memlimit 32mb"
+
+# -----------------------------
+# Self-update
+# -----------------------------
+SELFUPDATE_ENABLE=1
+GITHUB_RAW_URL="https://raw.githubusercontent.com/CustomMadecode/GODSMODE/master/godsmode.sh"
 
 # -----------------------------
 # Paths / logging
@@ -53,7 +88,6 @@ LAST_RATES="$STATE_DIR/last_sqm_rates.txt"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 chmod 700 "$GODMODE_DIR" "$LOG_DIR" "$STATE_DIR" 2>/dev/null || true
 
-# Simple log rotate (keep last ~2000 lines)
 rotate_log() {
   [ -f "$LOG" ] || return 0
   lines="$(wc -l < "$LOG" 2>/dev/null || echo 0)"
@@ -81,7 +115,7 @@ echo "[INFO] Kernel: $(uname -r 2>/dev/null || echo unknown)"
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # -----------------------------
-# WAN device resolution (OpenWrt 23.05 safe)
+# WAN device resolution (23.05 safe)
 # -----------------------------
 resolve_wan_dev() {
   if have_cmd ubus && have_cmd jsonfilter; then
@@ -123,41 +157,51 @@ set_mtu_safe() {
 }
 
 # -----------------------------
-# Busy check
+# Busy / Idle check (bytes/sec over 2 seconds)
 # -----------------------------
 read_bytes() {
   dev="$1"; dir="$2"
   cat "/sys/class/net/$dev/statistics/${dir}_bytes" 2>/dev/null || echo 0
 }
 
-is_link_busy() {
+wan_rates() {
   dev="$1"
   b1r="$(read_bytes "$dev" rx)"; b1t="$(read_bytes "$dev" tx)"
   sleep 2
   b2r="$(read_bytes "$dev" rx)"; b2t="$(read_bytes "$dev" tx)"
   rxps=$(((b2r - b1r) / 2))
   txps=$(((b2t - b1t) / 2))
+  echo "$rxps $txps"
+}
+
+is_link_busy() {
+  dev="$1"
+  set -- $(wan_rates "$dev")
+  rxps="$1"; txps="$2"
   echo "[INFO] WAN load($dev): rx=${rxps}B/s tx=${txps}B/s"
   [ "$rxps" -ge "$BUSY_RX_BYTES_PER_SEC" ] && return 0
   [ "$txps" -ge "$BUSY_TX_BYTES_PER_SEC" ] && return 0
   return 1
 }
 
+is_link_idle_enough() {
+  dev="$1"
+  set -- $(wan_rates "$dev")
+  rxps="$1"; txps="$2"
+  echo "[INFO] WAN idle-check($dev): rx=${rxps}B/s tx=${txps}B/s"
+  [ "$rxps" -le "$IDLE_RX_BYTES_PER_SEC" ] && [ "$txps" -le "$IDLE_TX_BYTES_PER_SEC" ]
+}
+
 # -----------------------------
-# SQM: enforce a single section sqm.wan (no surprises)
+# SQM: enforce single section sqm.wan
 # -----------------------------
 normalize_sqm_sections() {
-  # If sqm.eth1 exists or any @queue exists, we don't want multiple competing instances.
-  # Keep ONLY sqm.wan.
-  if ! uci -q get sqm.wan >/dev/null 2>&1; then
-    uci -q set sqm.wan='queue' || true
-  fi
+  uci -q get sqm.wan >/dev/null 2>&1 || uci -q set sqm.wan='queue' || true
 
-  # Disable common stray sections if present
+  # remove common conflicting named section
   uci -q delete sqm.eth1 >/dev/null 2>&1 || true
 
-  # If there are anonymous queues, disable them by setting enabled=0
-  # (we don't delete @queue[0] blindly; just neutralize)
+  # neutralize anonymous queues
   if uci -q show sqm 2>/dev/null | grep -q '^sqm\.\@queue\[[0-9]\+\]\.'; then
     i=0
     while uci -q get "sqm.@queue[$i]" >/dev/null 2>&1; do
@@ -195,15 +239,39 @@ EOF
   /etc/init.d/sqm restart >/dev/null 2>&1 || true
 
   echo "$down $up" > "$LAST_RATES" 2>/dev/null || true
-  echo "[OK] SQM applied: ${down}/${up} Mbps (note: SQM/CAKE may still display rtt 100ms)"
+  echo "[OK] SQM applied: ${down}/${up} Mbps"
 }
 
 # -----------------------------
-# nftables DSCP (own table only)
+# PS5 detection (IPv4)
+# -----------------------------
+detect_ps5_ips_v4() {
+  # 1) If user pinned PS5_IPS_V4, use it
+  if [ -n "${PS5_IPS_V4:-}" ]; then
+    echo "$PS5_IPS_V4"
+    return 0
+  fi
+
+  # 2) Try DHCP leases (dnsmasq)
+  # Format: <expiry> <mac> <ip> <hostname> <clientid>
+  ips="$(awk -v IGNORECASE=1 -v pat="$PS5_HOST_PAT" '
+    NF>=4 && $4 ~ pat {print $3}
+  ' /tmp/dhcp.leases 2>/dev/null | tr "\n" " " | sed "s/[ ]\+/ /g; s/^ //; s/ $//")"
+
+  [ -n "${ips:-}" ] && { echo "$ips"; return 0; }
+
+  # 3) Fallback: ARP neighbor table for "playstation/sony" (rare)
+  # (We can’t reliably map vendor without OUI db, so leave empty if not found)
+  echo ""
+}
+
+# -----------------------------
+# nftables DSCP (game ports + PS5 all traffic) in OUR table
 # -----------------------------
 NFT_TABLE="inet godmode"
 NFT_CHAIN="prerouting_mangle"
 GAME_SET="game_udp_ports"
+PS5_SET4="ps5_v4"
 
 ensure_nft_dscp() {
   [ "$ENABLE_DSCP" -eq 1 ] || { echo "[INFO] DSCP disabled (ENABLE_DSCP=0)."; return 0; }
@@ -214,34 +282,55 @@ ensure_nft_dscp() {
   if nft list chain $NFT_TABLE $NFT_CHAIN >/dev/null 2>&1; then
     nft flush chain $NFT_TABLE $NFT_CHAIN >/dev/null 2>&1 || true
   else
-    nft add chain $NFT_TABLE $NFT_CHAIN "{ type filter hook prerouting priority -150; policy accept; }" >/dev/null 2>&1 || true
+    nft add chain $NFT_TABLE $NFT_CHAIN "{ type filter hook prerouting priority mangle; policy accept; }" >/dev/null 2>&1 || true
   fi
 
+  # game ports set
   if nft list set $NFT_TABLE $GAME_SET >/dev/null 2>&1; then
     nft flush set $NFT_TABLE $GAME_SET >/dev/null 2>&1 || true
   else
     nft add set $NFT_TABLE $GAME_SET "{ type inet_service; flags interval; }" >/dev/null 2>&1 || true
   fi
-
   nft add element $NFT_TABLE $GAME_SET "$GAME_PORTS" >/dev/null 2>&1 || true
+
+  # PS5 IPv4 set (optional)
+  if [ "$ENABLE_PS5_PRIORITY" -eq 1 ]; then
+    if nft list set $NFT_TABLE $PS5_SET4 >/dev/null 2>&1; then
+      nft flush set $NFT_TABLE $PS5_SET4 >/dev/null 2>&1 || true
+    else
+      nft add set $NFT_TABLE $PS5_SET4 "{ type ipv4_addr; flags interval; }" >/dev/null 2>&1 || true
+    fi
+
+    ps5ips="$(detect_ps5_ips_v4)"
+    if [ -n "${ps5ips:-}" ]; then
+      for ip in $ps5ips; do
+        nft add element $NFT_TABLE $PS5_SET4 "{ $ip }" >/dev/null 2>&1 || true
+      done
+
+      # Priority rules FIRST (all PS5 traffic, TCP+UDP)
+      nft add rule $NFT_TABLE $NFT_CHAIN ip saddr @$PS5_SET4 ip dscp set $DSCP_GAME counter comment "GM_PS5_DSCP4_S" >/dev/null 2>&1 || true
+      nft add rule $NFT_TABLE $NFT_CHAIN ip daddr @$PS5_SET4 ip dscp set $DSCP_GAME counter comment "GM_PS5_DSCP4_D" >/dev/null 2>&1 || true
+      echo "[OK] PS5 priority active for IPv4: $ps5ips"
+    else
+      echo "[WARN] PS5 priority enabled but PS5 not detected in /tmp/dhcp.leases (set PS5_IPS_V4 to pin)."
+    fi
+  fi
+
+  # Game port DSCP (IPv4 + IPv6)
   nft add rule $NFT_TABLE $NFT_CHAIN udp dport @$GAME_SET ip  dscp set $DSCP_GAME counter comment "GM_GAME_DSCP4" >/dev/null 2>&1 || true
   nft add rule $NFT_TABLE $NFT_CHAIN udp dport @$GAME_SET ip6 dscp set $DSCP_GAME counter comment "GM_GAME_DSCP6" >/dev/null 2>&1 || true
 
-  echo "[OK] nftables DSCP ensured (IPv4+IPv6) with counters."
+  echo "[OK] nftables DSCP ensured (counters enabled)."
 }
 
 # -----------------------------
-# Speedtest (robust)
-# - Preferred: speedtest-netperf.sh (OpenWrt package)
-# - Optional: librespeed-cli (if installed + reachable)
-# - Skips if busy, or if errors/0Mbps/invalid output
+# Speedtest (safe)
 # -----------------------------
 parse_netperf_out() {
-  # Extract numeric Mbps from speedtest-netperf output, even if warnings exist.
-  # Return: "DOWN UP" or empty.
   out="$1"
-  # Only trust if it does NOT contain netperf fatal error patterns
-  echo "$out" | grep -qiE 'invalid number|recv_response: partial|WARNING: netperf returned errors' && return 1
+
+  # Reject known-bad patterns seen on TMHI
+  echo "$out" | grep -qiE 'recv_response: partial|invalid number|WARNING: netperf returned errors' && return 1
 
   down="$(echo "$out" | awk '
     /Download:/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}
@@ -249,64 +338,39 @@ parse_netperf_out() {
   up="$(echo "$out" | awk '
     /Upload:/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}
   ')"
-
   [ -n "${down:-}" ] && [ -n "${up:-}" ] || return 1
 
   down_i="$(printf "%.0f\n" "$down" 2>/dev/null || echo "")"
   up_i="$(printf "%.0f\n" "$up" 2>/dev/null || echo "")"
   [ -n "${down_i:-}" ] && [ -n "${up_i:-}" ] || return 1
-
   [ "$down_i" -gt 0 ] && [ "$up_i" -gt 0 ] || return 1
+
   echo "$down_i $up_i"
 }
 
 run_speedtest() {
-  if is_link_busy "$BUSY_DEV"; then
-    echo "[SKIP] WAN is busy; skipping speedtest."
+  # Must be idle enough (stronger than busy-skip)
+  if ! is_link_idle_enough "$BUSY_DEV"; then
+    echo "[SKIP] Not idle enough; skipping speedtest."
     return 2
   fi
 
-  # 1) speedtest-netperf.sh
-  if have_cmd speedtest-netperf.sh || [ -x /usr/bin/speedtest-netperf.sh ]; then
+  if [ -x /usr/bin/speedtest-netperf.sh ]; then
     echo "[INFO] Running speedtest-netperf.sh (IPv4)..."
     out="$(/usr/bin/speedtest-netperf.sh -4 2>&1 || true)"
     echo "$out" | tail -n 120 | sed 's/\r//g' | while IFS= read -r line; do echo "[ST] $line"; done
     res="$(parse_netperf_out "$out" 2>/dev/null || true)"
-    if [ -n "${res:-}" ]; then
-      echo "$res"
-      return 0
-    fi
+    [ -n "${res:-}" ] && { echo "$res"; return 0; }
     echo "[WARN] speedtest-netperf result unusable (TMHI/netperf errors likely)."
-  fi
-
-  # 2) librespeed-cli (optional)
-  if have_cmd librespeed-cli; then
-    echo "[INFO] Running librespeed-cli (may fail on some networks)..."
-    out="$(librespeed-cli --simple 2>&1 || true)"
-    echo "$out" | tail -n 80 | sed 's/\r//g' | while IFS= read -r line; do echo "[ST] $line"; done
-    down_i="$(echo "$out" | awk -F'[: ]+' '/Download/{print int($2)}' | head -n1)"
-    up_i="$(echo "$out" | awk -F'[: ]+' '/Upload/{print int($2)}' | head -n1)"
-    if [ -n "${down_i:-}" ] && [ -n "${up_i:-}" ] && [ "$down_i" -gt 0 ] && [ "$up_i" -gt 0 ]; then
-      echo "$down_i $up_i"
-      return 0
-    fi
-    echo "[WARN] librespeed-cli result unusable (timeout/blocked)."
+  else
+    echo "[WARN] speedtest-netperf.sh missing; autotune will not adjust rates."
   fi
 
   return 1
 }
 
-clamp() {
-  v="$1"; min="$2"; max="$3"
-  [ "$v" -lt "$min" ] && v="$min"
-  [ "$v" -gt "$max" ] && v="$max"
-  echo "$v"
-}
-
-pct_of() {
-  v="$1"; pct="$2"
-  echo $(( v * pct / 100 ))
-}
+clamp() { v="$1"; min="$2"; max="$3"; [ "$v" -lt "$min" ] && v="$min"; [ "$v" -gt "$max" ] && v="$max"; echo "$v"; }
+pct_of() { v="$1"; pct="$2"; echo $(( v * pct / 100 )); }
 
 change_pct_ge() {
   new="$1"; old="$2"; thr="$3"
@@ -319,9 +383,8 @@ autotune_sqm() {
   echo "[INFO] AutoTune requested..."
   res="$(run_speedtest 2>/dev/null || true)"
   rc="$?"
-  if [ "$rc" -eq 2 ]; then
-    return 0
-  fi
+  [ "$rc" -eq 2 ] && return 0
+
   if [ -z "${res:-}" ]; then
     echo "[WARN] Speedtest failed/unusable; keeping last SQM."
     return 0
@@ -329,20 +392,14 @@ autotune_sqm() {
 
   measured_down="$(echo "$res" | awk '{print $1}')"
   measured_up="$(echo "$res" | awk '{print $2}')"
-  [ "${measured_down:-0}" -gt 0 ] && [ "${measured_up:-0}" -gt 0 ] || {
-    echo "[WARN] Speedtest returned 0 Mbps; keeping last SQM."
-    return 0
-  }
+  [ "${measured_down:-0}" -gt 0 ] && [ "${measured_up:-0}" -gt 0 ] || { echo "[WARN] Speedtest returned 0; keeping last SQM."; return 0; }
 
   echo "[INFO] Measured: ${measured_down}/${measured_up} Mbps"
 
-  target_down="$(pct_of "$measured_down" "$DOWN_PCT")"
-  target_up="$(pct_of "$measured_up" "$UP_PCT")"
+  target_down="$(clamp "$(pct_of "$measured_down" "$DOWN_PCT")" "$MIN_DOWN_MBIT" "$CAP_DOWN_MBIT")"
+  target_up="$(clamp "$(pct_of "$measured_up" "$UP_PCT")" "$MIN_UP_MBIT" "$CAP_UP_MBIT")"
 
-  target_down="$(clamp "$target_down" "$MIN_DOWN_MBIT" "$CAP_DOWN_MBIT")"
-  target_up="$(clamp "$target_up" "$MIN_UP_MBIT" "$CAP_UP_MBIT")"
-
-  echo "[INFO] Target (pct+clamp): ${target_down}/${target_up} Mbps"
+  echo "[INFO] Target: ${target_down}/${target_up} Mbps"
 
   prev_down=0; prev_up=0
   if [ -f "$LAST_RATES" ]; then
@@ -351,8 +408,8 @@ autotune_sqm() {
   fi
 
   apply_up=0; apply_down=0
-  if change_pct_ge "$target_up" "$prev_up" "$THRESH_UP_PCT"; then apply_up=1; fi
-  if change_pct_ge "$target_down" "$prev_down" "$THRESH_DOWN_PCT"; then apply_down=1; fi
+  change_pct_ge "$target_up" "$prev_up" "$THRESH_UP_PCT" && apply_up=1
+  change_pct_ge "$target_down" "$prev_down" "$THRESH_DOWN_PCT" && apply_down=1
 
   if [ "$apply_up" -eq 0 ] && [ "$apply_down" -eq 0 ]; then
     echo "[OK] Below thresholds; no SQM restart. Keeping ${prev_down}/${prev_up} Mbps"
@@ -364,7 +421,7 @@ autotune_sqm() {
 }
 
 # -----------------------------
-# Base apply (MTU + DSCP)
+# Base apply (MTU + DSCP + PS5 detect)
 # -----------------------------
 apply_base_once() {
   WAN_DEV="$(resolve_wan_dev)"
@@ -389,12 +446,52 @@ apply_last_sqm_if_present() {
 }
 
 # -----------------------------
+# Self update (safe)
+# -----------------------------
+self_update() {
+  [ "$SELFUPDATE_ENABLE" -eq 1 ] || return 0
+  have_cmd wget || { echo "[WARN] wget not found; selfupdate skipped."; return 0; }
+
+  tmp="/tmp/godsmode.new.$$"
+  echo "[INFO] Self-update: fetching $GITHUB_RAW_URL"
+  if ! wget -qO "$tmp" "$GITHUB_RAW_URL"; then
+    echo "[WARN] Self-update: fetch failed."
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ ! -s "$tmp" ]; then
+    echo "[WARN] Self-update: empty download."
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  fi
+
+  # Compare (sha256 if available, else cmp)
+  changed=1
+  if have_cmd sha256sum; then
+    a="$(sha256sum "$SELF_PATH" 2>/dev/null | awk "{print \$1}" || true)"
+    b="$(sha256sum "$tmp" 2>/dev/null | awk "{print \$1}" || true)"
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ] && changed=0
+  else
+    cmp -s "$SELF_PATH" "$tmp" && changed=0 || true
+  fi
+
+  if [ "$changed" -eq 0 ]; then
+    echo "[OK] Self-update: no change."
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  fi
+
+  mv "$tmp" "$SELF_PATH" 2>/dev/null || { echo "[WARN] Self-update: replace failed."; rm -f "$tmp" 2>/dev/null || true; return 0; }
+  chmod +x "$SELF_PATH" 2>/dev/null || true
+  echo "[OK] Self-update: updated script."
+}
+
+# -----------------------------
 # Install / Uninstall (procd + cron)
 # -----------------------------
 install_service_and_cron() {
   echo "[INFO] Installing procd boot service + cron..."
-
-  mkdir -p /root/godmode/logs /root/godmode/state >/dev/null 2>&1 || true
 
   cat > /etc/init.d/godmode_static <<'INIT'
 #!/bin/sh /etc/rc.common
@@ -403,23 +500,31 @@ USE_PROCD=1
 
 start_service() {
   procd_open_instance
-  procd_set_param command /bin/sh -c "sleep 20; /root/godmode/godmode_static.sh --apply >>/root/godmode/logs/boot_apply.log 2>&1"
+  procd_set_param command /bin/sh -c "sleep 20; /root/godmode/godsmode.sh --apply >>/root/godmode/logs/boot_apply.log 2>&1"
   procd_set_param respawn 0 0 0
   procd_close_instance
 }
 INIT
+
   chmod +x /etc/init.d/godmode_static
   /etc/init.d/godmode_static enable >/dev/null 2>&1 || true
 
   CR=/etc/crontabs/root
   [ -f "$CR" ] || touch "$CR"
-  sed -i '/godmode_static\.sh/d' "$CR" 2>/dev/null || true
+  sed -i '/godsmode\.sh/d' "$CR" 2>/dev/null || true
 
-  echo "$DAILY_MINUTE $DAILY_HOUR * * * /root/godmode/godmode_static.sh --apply >>/root/godmode/logs/cron_apply.log 2>&1" >> "$CR"
-  echo "$AUTOTUNE_MINUTE */$AUTOTUNE_EVERY_N_HOURS * * * /root/godmode/godmode_static.sh --autotune >>/root/godmode/logs/autotune_${AUTOTUNE_EVERY_N_HOURS}hour.log 2>&1" >> "$CR"
+  # Daily apply (base + last SQM, no speedtest)
+  echo "$DAILY_MINUTE $DAILY_HOUR * * * /root/godmode/godsmode.sh --apply >>/root/godmode/logs/cron_apply.log 2>&1" >> "$CR"
+
+  # Autotune only when idle enough (safe)
+  echo "$AUTOTUNE_MINUTE */$AUTOTUNE_EVERY_N_HOURS * * * /root/godmode/godsmode.sh --autotune >>/root/godmode/logs/autotune_${AUTOTUNE_EVERY_N_HOURS}hour.log 2>&1" >> "$CR"
+
+  # Self update daily
+  echo "$SELFUPDATE_MINUTE $SELFUPDATE_HOUR * * * /root/godmode/godsmode.sh --selfupdate >>/root/godmode/logs/selfupdate.log 2>&1" >> "$CR"
 
   /etc/init.d/cron enable >/dev/null 2>&1 || true
   /etc/init.d/cron restart >/dev/null 2>&1 || true
+
   echo "[DONE] Boot service + cron installed."
 }
 
@@ -428,7 +533,7 @@ uninstall_hooks() {
   /etc/init.d/godmode_static disable >/dev/null 2>&1 || true
   rm -f /etc/init.d/godmode_static 2>/dev/null || true
   CR=/etc/crontabs/root
-  [ -f "$CR" ] && sed -i '/godmode_static\.sh/d' "$CR" >/dev/null 2>&1 || true
+  [ -f "$CR" ] && sed -i '/godsmode\.sh/d' "$CR" >/dev/null 2>&1 || true
   /etc/init.d/cron restart >/dev/null 2>&1 || true
   echo "[DONE] Hooks removed."
 }
@@ -438,6 +543,7 @@ uninstall_hooks() {
 # -----------------------------
 case "${1:-}" in
   --install)
+    self_update || true
     apply_base_once
     autotune_sqm || true
     install_service_and_cron
@@ -450,6 +556,9 @@ case "${1:-}" in
     apply_base_once
     autotune_sqm || true
     ;;
+  --selfupdate)
+    self_update || true
+    ;;
   --uninstall)
     uninstall_hooks
     ;;
@@ -459,14 +568,14 @@ case "${1:-}" in
     ;;
   * )
     echo "Usage:"
-    echo "  $SELF_PATH                 # apply base + autotune (skips if busy)"
-    echo "  $SELF_PATH --install       # apply + install boot service + daily + N-hour autotune"
-    echo "  $SELF_PATH --apply         # re-apply base + last known SQM (no speedtest)"
-    echo "  $SELF_PATH --autotune      # speedtest + adjust SQM (skips if busy)"
-    echo "  $SELF_PATH --uninstall     # remove boot + cron hooks"
+    echo "  $SELF_PATH                 # apply base + autotune (idle-only)"
+    echo "  $SELF_PATH --install       # install boot+cron + run once"
+    echo "  $SELF_PATH --apply         # base + last SQM (no speedtest)"
+    echo "  $SELF_PATH --autotune      # idle-only speedtest -> adjust SQM"
+    echo "  $SELF_PATH --selfupdate    # update from GitHub"
+    echo "  $SELF_PATH --uninstall     # remove hooks"
     exit 2
     ;;
 esac
-
 
 exit 0
