@@ -1,47 +1,44 @@
 #!/bin/sh
-# Flint 2 GOD MODE — OpenWrt 23.05-safe
+# Flint 2 GOD MODE — OpenWrt 23.05-safe (TMHI-hardened)
 # - Static MTU set once
 # - nft DSCP mark IPv4/IPv6 + counters
-# - SQM AutoTune via speedtest-netperf (SKIPS if WAN busy)
+# - SQM AutoTune (robust parsing; skips on busy/failed/0Mbps)
 # - Installs procd boot service + cron daily apply + autotune every N hours
 
 set -eu
 
 # -----------------------------
-# Speed caps (your observed T-Mobile max)
+# Tunables (your TMHI profile)
 # -----------------------------
 CAP_DOWN_MBIT=777
 CAP_UP_MBIT=140
 
-# Safety floors (avoid low/glitched tests)
 MIN_DOWN_MBIT=120
 MIN_UP_MBIT=20
 
-# Target shaping percent of measured speed
 DOWN_PCT=92
 UP_PCT=88
 
-# Apply only if change is meaningful (avoid SQM restart hiccups)
 THRESH_DOWN_PCT=10
 THRESH_UP_PCT=6
 
-# WAN MTU (your tested best)
 WAN_MTU=1370
 
-# DSCP tagging
 ENABLE_DSCP=1
 DSCP_GAME=46
 GAME_PORTS="{ 3074, 3478-3479, 3659, 9295-9304, 1935 }"
 
-# Busy-skip thresholds (bytes/sec over 2 seconds)
-BUSY_RX_BYTES_PER_SEC=2500000   # ~2.5 MB/s download
-BUSY_TX_BYTES_PER_SEC=1000000   # ~1.0 MB/s upload
+BUSY_RX_BYTES_PER_SEC=2500000
+BUSY_TX_BYTES_PER_SEC=1000000
 
-# Schedules (router local time)
 DAILY_HOUR=4
 DAILY_MINUTE=17
 AUTOTUNE_MINUTE=7
 AUTOTUNE_EVERY_N_HOURS=3
+
+# SQM CAKE options (keep your intent; SQM may still show rtt 100ms)
+QDISC_OPTS="diffserv4 nat wash rtt 20ms memlimit 32mb"
+QDISC_OPTS_INGRESS="diffserv4 nat wash rtt 20ms memlimit 32mb"
 
 # -----------------------------
 # Paths / logging
@@ -56,6 +53,14 @@ LAST_RATES="$STATE_DIR/last_sqm_rates.txt"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 chmod 700 "$GODMODE_DIR" "$LOG_DIR" "$STATE_DIR" 2>/dev/null || true
 
+# Simple log rotate (keep last ~2000 lines)
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  lines="$(wc -l < "$LOG" 2>/dev/null || echo 0)"
+  [ "$lines" -le 2500 ] && return 0
+  tail -n 2000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null || true
+}
+
 # -----------------------------
 # Lock
 # -----------------------------
@@ -67,6 +72,7 @@ else
 fi
 trap 'rm -rf "$LOCKDIR"' EXIT INT TERM
 
+rotate_log
 exec >>"$LOG" 2>&1
 echo "=== GOD MODE START $(date) ==="
 echo "[INFO] Script: $SELF_PATH"
@@ -76,15 +82,12 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # -----------------------------
 # WAN device resolution (OpenWrt 23.05 safe)
-# Prefer ubus network.interface.wan status, fall back to UCI, fall back to default route.
-# Also choose a "busy-check device" that is *physical-ish* when WAN is PPPoE.
 # -----------------------------
 resolve_wan_dev() {
-  # ubus is most reliable
   if have_cmd ubus && have_cmd jsonfilter; then
     st="$(ubus call network.interface.wan status 2>/dev/null || true)"
-    dev="$(echo "$st" | jsonfilter -e '@.device' 2>/dev/null || true)"
-    [ -n "${dev:-}" ] || dev="$(echo "$st" | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+    dev="$(echo "$st" | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+    [ -n "${dev:-}" ] || dev="$(echo "$st" | jsonfilter -e '@.device' 2>/dev/null || true)"
     [ -n "${dev:-}" ] && echo "$dev" && return 0
   fi
 
@@ -100,12 +103,10 @@ resolve_wan_dev() {
   echo "wan"
 }
 
-# If WAN_DEV is pppoe-wan, SQM + busy checks are better on underlying device
 resolve_busy_dev() {
   dev="$1"
   case "$dev" in
     pppoe-*)
-      # Default route device often reveals the underlying link
       under="$(ip route show default 2>/dev/null | awk '{print $5; exit}' || true)"
       [ -n "${under:-}" ] && echo "$under" || echo "$dev"
       ;;
@@ -143,52 +144,50 @@ is_link_busy() {
 }
 
 # -----------------------------
-# SQM helpers (ensure a queue section exists)
+# SQM: enforce a single section sqm.wan (no surprises)
 # -----------------------------
-ensure_sqm_section() {
-  # Prefer named section sqm.wan if present, else create sqm.wan
-  if uci -q get sqm.wan >/dev/null 2>&1; then
-    echo "wan"
-    return 0
+normalize_sqm_sections() {
+  # If sqm.eth1 exists or any @queue exists, we don't want multiple competing instances.
+  # Keep ONLY sqm.wan.
+  if ! uci -q get sqm.wan >/dev/null 2>&1; then
+    uci -q set sqm.wan='queue' || true
   fi
 
-  # If any @queue exists, use first
-  if uci -q show sqm 2>/dev/null | grep -q '^sqm\.\@queue\[0\]\.'; then
-    echo "@queue[0]"
-    return 0
+  # Disable common stray sections if present
+  uci -q delete sqm.eth1 >/dev/null 2>&1 || true
+
+  # If there are anonymous queues, disable them by setting enabled=0
+  # (we don't delete @queue[0] blindly; just neutralize)
+  if uci -q show sqm 2>/dev/null | grep -q '^sqm\.\@queue\[[0-9]\+\]\.'; then
+    i=0
+    while uci -q get "sqm.@queue[$i]" >/dev/null 2>&1; do
+      uci -q set "sqm.@queue[$i].enabled=0" >/dev/null 2>&1 || true
+      i=$((i+1))
+    done
   fi
 
-  # Create a new named section
-  uci -q set sqm.wan='queue' || true
-  echo "wan"
+  uci -q commit sqm >/dev/null 2>&1 || true
 }
 
 apply_sqm() {
   down="$1"; up="$2"
   [ -x /etc/init.d/sqm ] || { echo "[WARN] SQM not installed; skipping SQM."; return 0; }
 
-  sec="$(ensure_sqm_section)"
-  # uci path prefix
-  case "$sec" in
-    wan) P="sqm.wan" ;;
-    @queue[0]) P="sqm.@queue[0]" ;;
-    *) P="sqm.wan" ;;
-  esac
+  normalize_sqm_sections
 
-  # SQM expects kbit/s
   uci -q batch <<EOF
-set ${P}.interface='${WAN_DEV}'
-set ${P}.enabled='1'
-set ${P}.qdisc='cake'
-set ${P}.script='piece_of_cake.qos'
-set ${P}.download='$((down * 1000))'
-set ${P}.upload='$((up * 1000))'
-set ${P}.qdisc_advanced='1'
-set ${P}.qdisc_really_really_advanced='1'
-set ${P}.ingress_ecn='ECN'
-set ${P}.egress_ecn='ECN'
-set ${P}.qdisc_opts='diffserv4 nat wash rtt 20ms memlimit 32mb'
-set ${P}.qdisc_opts_ingress='diffserv4 nat wash rtt 20ms memlimit 32mb'
+set sqm.wan.interface='${WAN_DEV}'
+set sqm.wan.enabled='1'
+set sqm.wan.qdisc='cake'
+set sqm.wan.script='piece_of_cake.qos'
+set sqm.wan.download='$((down * 1000))'
+set sqm.wan.upload='$((up * 1000))'
+set sqm.wan.qdisc_advanced='1'
+set sqm.wan.qdisc_really_really_advanced='1'
+set sqm.wan.ingress_ecn='ECN'
+set sqm.wan.egress_ecn='ECN'
+set sqm.wan.qdisc_opts='${QDISC_OPTS}'
+set sqm.wan.qdisc_opts_ingress='${QDISC_OPTS_INGRESS}'
 EOF
 
   uci -q commit sqm >/dev/null 2>&1 || true
@@ -196,11 +195,11 @@ EOF
   /etc/init.d/sqm restart >/dev/null 2>&1 || true
 
   echo "$down $up" > "$LAST_RATES" 2>/dev/null || true
-  echo "[OK] SQM applied: ${down}/${up} Mbps"
+  echo "[OK] SQM applied: ${down}/${up} Mbps (note: SQM/CAKE may still display rtt 100ms)"
 }
 
 # -----------------------------
-# nftables DSCP (own table only; safe to flush within that table)
+# nftables DSCP (own table only)
 # -----------------------------
 NFT_TABLE="inet godmode"
 NFT_CHAIN="prerouting_mangle"
@@ -210,11 +209,9 @@ ensure_nft_dscp() {
   [ "$ENABLE_DSCP" -eq 1 ] || { echo "[INFO] DSCP disabled (ENABLE_DSCP=0)."; return 0; }
   have_cmd nft || { echo "[WARN] nft not installed; skipping nft/DSCP."; return 0; }
 
-  # Create table/chain/set if missing
   nft list table $NFT_TABLE >/dev/null 2>&1 || nft add table $NFT_TABLE >/dev/null 2>&1 || true
 
   if nft list chain $NFT_TABLE $NFT_CHAIN >/dev/null 2>&1; then
-    # only flush OUR chain (safe)
     nft flush chain $NFT_TABLE $NFT_CHAIN >/dev/null 2>&1 || true
   else
     nft add chain $NFT_TABLE $NFT_CHAIN "{ type filter hook prerouting priority -150; policy accept; }" >/dev/null 2>&1 || true
@@ -227,8 +224,6 @@ ensure_nft_dscp() {
   fi
 
   nft add element $NFT_TABLE $GAME_SET "$GAME_PORTS" >/dev/null 2>&1 || true
-
-  # Rules
   nft add rule $NFT_TABLE $NFT_CHAIN udp dport @$GAME_SET ip  dscp set $DSCP_GAME counter comment "GM_GAME_DSCP4" >/dev/null 2>&1 || true
   nft add rule $NFT_TABLE $NFT_CHAIN udp dport @$GAME_SET ip6 dscp set $DSCP_GAME counter comment "GM_GAME_DSCP6" >/dev/null 2>&1 || true
 
@@ -236,31 +231,69 @@ ensure_nft_dscp() {
 }
 
 # -----------------------------
-# Speedtest + compute targets (SKIPS when WAN is busy)
+# Speedtest (robust)
+# - Preferred: speedtest-netperf.sh (OpenWrt package)
+# - Optional: librespeed-cli (if installed + reachable)
+# - Skips if busy, or if errors/0Mbps/invalid output
 # -----------------------------
-run_speedtest() {
-  have_cmd speedtest-netperf || { echo "[ERR] speedtest-netperf not installed. Install: opkg update && opkg install speedtest-netperf"; return 1; }
+parse_netperf_out() {
+  # Extract numeric Mbps from speedtest-netperf output, even if warnings exist.
+  # Return: "DOWN UP" or empty.
+  out="$1"
+  # Only trust if it does NOT contain netperf fatal error patterns
+  echo "$out" | grep -qiE 'invalid number|recv_response: partial|WARNING: netperf returned errors' && return 1
 
+  down="$(echo "$out" | awk '
+    /Download:/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}
+  ')"
+  up="$(echo "$out" | awk '
+    /Upload:/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}
+  ')"
+
+  [ -n "${down:-}" ] && [ -n "${up:-}" ] || return 1
+
+  down_i="$(printf "%.0f\n" "$down" 2>/dev/null || echo "")"
+  up_i="$(printf "%.0f\n" "$up" 2>/dev/null || echo "")"
+  [ -n "${down_i:-}" ] && [ -n "${up_i:-}" ] || return 1
+
+  [ "$down_i" -gt 0 ] && [ "$up_i" -gt 0 ] || return 1
+  echo "$down_i $up_i"
+}
+
+run_speedtest() {
   if is_link_busy "$BUSY_DEV"; then
     echo "[SKIP] WAN is busy; skipping speedtest."
     return 2
   fi
 
-  out="$(speedtest-netperf 2>/dev/null || true)"
-  echo "$out" | tail -n 80 | sed 's/\r//g' | while IFS= read -r line; do echo "[ST] $line"; done
+  # 1) speedtest-netperf.sh
+  if have_cmd speedtest-netperf.sh || [ -x /usr/bin/speedtest-netperf.sh ]; then
+    echo "[INFO] Running speedtest-netperf.sh (IPv4)..."
+    out="$(/usr/bin/speedtest-netperf.sh -4 2>&1 || true)"
+    echo "$out" | tail -n 120 | sed 's/\r//g' | while IFS= read -r line; do echo "[ST] $line"; done
+    res="$(parse_netperf_out "$out" 2>/dev/null || true)"
+    if [ -n "${res:-}" ]; then
+      echo "$res"
+      return 0
+    fi
+    echo "[WARN] speedtest-netperf result unusable (TMHI/netperf errors likely)."
+  fi
 
-  down="$(echo "$out" | awk '/Download/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9.]+$/) {print $i; exit}}')"
-  up="$(echo "$out" | awk '/Upload/   {for(i=1;i<=NF;i++) if ($i ~ /^[0-9.]+$/) {print $i; exit}}')"
+  # 2) librespeed-cli (optional)
+  if have_cmd librespeed-cli; then
+    echo "[INFO] Running librespeed-cli (may fail on some networks)..."
+    out="$(librespeed-cli --simple 2>&1 || true)"
+    echo "$out" | tail -n 80 | sed 's/\r//g' | while IFS= read -r line; do echo "[ST] $line"; done
+    down_i="$(echo "$out" | awk -F'[: ]+' '/Download/{print int($2)}' | head -n1)"
+    up_i="$(echo "$out" | awk -F'[: ]+' '/Upload/{print int($2)}' | head -n1)"
+    if [ -n "${down_i:-}" ] && [ -n "${up_i:-}" ] && [ "$down_i" -gt 0 ] && [ "$up_i" -gt 0 ]; then
+      echo "$down_i $up_i"
+      return 0
+    fi
+    echo "[WARN] librespeed-cli result unusable (timeout/blocked)."
+  fi
 
-  [ -n "${down:-}" ] || return 1
-  [ -n "${up:-}" ] || return 1
-
-  down_i="$(printf "%.0f\n" "$down" 2>/dev/null || echo "")"
-  up_i="$(printf "%.0f\n" "$up" 2>/dev/null || echo "")"
-  [ -n "${down_i:-}" ] || return 1
-  [ -n "${up_i:-}" ] || return 1
-
-  echo "$down_i $up_i"
+  return 1
 }
 
 clamp() {
@@ -290,12 +323,17 @@ autotune_sqm() {
     return 0
   fi
   if [ -z "${res:-}" ]; then
-    echo "[WARN] Speedtest failed; not changing SQM."
+    echo "[WARN] Speedtest failed/unusable; keeping last SQM."
     return 0
   fi
 
   measured_down="$(echo "$res" | awk '{print $1}')"
   measured_up="$(echo "$res" | awk '{print $2}')"
+  [ "${measured_down:-0}" -gt 0 ] && [ "${measured_up:-0}" -gt 0 ] || {
+    echo "[WARN] Speedtest returned 0 Mbps; keeping last SQM."
+    return 0
+  }
+
   echo "[INFO] Measured: ${measured_down}/${measured_up} Mbps"
 
   target_down="$(pct_of "$measured_down" "$DOWN_PCT")"
@@ -317,7 +355,7 @@ autotune_sqm() {
   if change_pct_ge "$target_down" "$prev_down" "$THRESH_DOWN_PCT"; then apply_down=1; fi
 
   if [ "$apply_up" -eq 0 ] && [ "$apply_down" -eq 0 ]; then
-    echo "[OK] Changes below thresholds; no SQM restart. Keeping ${prev_down}/${prev_up} Mbps"
+    echo "[OK] Below thresholds; no SQM restart. Keeping ${prev_down}/${prev_up} Mbps"
     return 0
   fi
 
@@ -356,7 +394,8 @@ apply_last_sqm_if_present() {
 install_service_and_cron() {
   echo "[INFO] Installing procd boot service + cron..."
 
-  # procd init script
+  mkdir -p /root/godmode/logs /root/godmode/state >/dev/null 2>&1 || true
+
   cat > /etc/init.d/godmode_static <<'INIT'
 #!/bin/sh /etc/rc.common
 START=95
@@ -364,7 +403,7 @@ USE_PROCD=1
 
 start_service() {
   procd_open_instance
-  procd_set_param command /bin/sh -c "sleep 20; /root/godmode/godmode_static.sh --apply"
+  procd_set_param command /bin/sh -c "sleep 20; /root/godmode/godmode_static.sh --apply >>/root/godmode/logs/boot_apply.log 2>&1"
   procd_set_param respawn 0 0 0
   procd_close_instance
 }
@@ -372,15 +411,14 @@ INIT
   chmod +x /etc/init.d/godmode_static
   /etc/init.d/godmode_static enable >/dev/null 2>&1 || true
 
-  # cron
   CR=/etc/crontabs/root
   [ -f "$CR" ] || touch "$CR"
-  # remove older entries for this script
   sed -i '/godmode_static\.sh/d' "$CR" 2>/dev/null || true
 
-  echo "$DAILY_MINUTE $DAILY_HOUR * * * /root/godmode/godmode_static.sh --apply >/root/godmode/logs/cron_apply.log 2>&1" >> "$CR"
-  echo "$AUTOTUNE_MINUTE */$AUTOTUNE_EVERY_N_HOURS * * * /root/godmode/godmode_static.sh --autotune >/root/godmode/logs/autotune_${AUTOTUNE_EVERY_N_HOURS}hour.log 2>&1" >> "$CR"
+  echo "$DAILY_MINUTE $DAILY_HOUR * * * /root/godmode/godmode_static.sh --apply >>/root/godmode/logs/cron_apply.log 2>&1" >> "$CR"
+  echo "$AUTOTUNE_MINUTE */$AUTOTUNE_EVERY_N_HOURS * * * /root/godmode/godmode_static.sh --autotune >>/root/godmode/logs/autotune_${AUTOTUNE_EVERY_N_HOURS}hour.log 2>&1" >> "$CR"
 
+  /etc/init.d/cron enable >/dev/null 2>&1 || true
   /etc/init.d/cron restart >/dev/null 2>&1 || true
   echo "[DONE] Boot service + cron installed."
 }
@@ -422,7 +460,7 @@ case "${1:-}" in
   * )
     echo "Usage:"
     echo "  $SELF_PATH                 # apply base + autotune (skips if busy)"
-    echo "  $SELF_PATH --install       # apply + install boot service + daily + 3-hour autotune"
+    echo "  $SELF_PATH --install       # apply + install boot service + daily + N-hour autotune"
     echo "  $SELF_PATH --apply         # re-apply base + last known SQM (no speedtest)"
     echo "  $SELF_PATH --autotune      # speedtest + adjust SQM (skips if busy)"
     echo "  $SELF_PATH --uninstall     # remove boot + cron hooks"
